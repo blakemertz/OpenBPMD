@@ -517,12 +517,28 @@ def grand_equilibrate(
     print("  GCMC stage 1a: 10,000 insertion/deletion moves...")
     gcmc_mover.move(simulation.context, 10000)
 
+    # Minimise after pure GCMC to resolve any steric clashes introduced by
+    # freshly inserted waters before MD steps begin.
+    print("  Minimizing after stage 1a...")
+    simulation.minimizeEnergy(maxIterations=500)
+    simulation.context.setVelocitiesToTemperature(300*kelvin)
+
     # Stage 1b: 1 ps interleaved GCMC/MD (100 × [1,000 moves + 5 MD steps])
+    # Use 1 fs timestep here for extra stability during frequent insertions.
     print("  GCMC stage 1b: 1 ps interleaved GCMC/MD...")
+    integrator_1b = LangevinIntegrator(300*kelvin, 1/picosecond, 0.001*picoseconds)
+    simulation_1b = Simulation(topology, system, integrator_1b, platform, properties)
+    state_1a = simulation.context.getState(
+        getPositions=True, getVelocities=True, enforcePeriodicBox=True
+    )
+    simulation_1b.context.setPositions(state_1a.getPositions())
+    simulation_1b.context.setVelocities(state_1a.getVelocities())
+    simulation_1b.context.setPeriodicBoxVectors(*state_1a.getPeriodicBoxVectors())
+    gcmc_mover.context = simulation_1b.context
     for i in range(100):
-        gcmc_mover.move(simulation.context, 1000)
-        gcmc_mover.report(simulation)
-        simulation.step(5)  # 5 × 2 fs = 10 fs
+        gcmc_mover.move(simulation_1b.context, 1000)
+        gcmc_mover.report(simulation_1b)
+        simulation_1b.step(10)  # 10 × 1 fs = 10 fs
 
     # ------------------------------------------------------------------ #
     # Stage 2: 500 ps NPT MD to re-equilibrate box volume                 #
@@ -532,7 +548,7 @@ def grand_equilibrate(
 
     integrator2 = LangevinIntegrator(300*kelvin, 1/picosecond, 0.002*picoseconds)
     simulation2 = Simulation(topology, system, integrator2, platform, properties)
-    state = simulation.context.getState(
+    state = simulation_1b.context.getState(
         getPositions=True, getVelocities=True, enforcePeriodicBox=True
     )
     simulation2.context.setPositions(state.getPositions())
