@@ -169,7 +169,7 @@ def get_pose_score(structure_file, trajectory_file, lig_resname):
                  groupselections=[f'resname {lig_resname} and not name H*'],
                  ref_frame=0).run()
     # Get the PoseScores as np.array
-    pose_scores = r.rmsd[1:, -1]
+    pose_scores = r.results.rmsd[1:, -1]
 
     return pose_scores
 
@@ -191,11 +191,13 @@ def plot_all_reps(run_dir, save_fig=False):
     if not rep_dirs:
         raise Exception(f"No rep_* found in '{run_dir}'")
     
-    # We'll store the results from 10 repeats in a 10x99 matrix.
+    # Determine frame count from the first CSV to support any simulation length.
     n_reps = len(rep_dirs)
-    CompScores = np.zeros((n_reps,99))
-    PoseScores = np.zeros((n_reps,99))
-    ContactScores = np.zeros((n_reps,99))
+    first_df = pd.read_csv(os.path.join(rep_dirs[0], 'bpmd_results.csv'))
+    n_frames = len(first_df)
+    CompScores = np.zeros((n_reps, n_frames))
+    PoseScores = np.zeros((n_reps, n_frames))
+    ContactScores = np.zeros((n_reps, n_frames))
 
     # Fill those matrices with the scores from each repeat
     for idx, rep_dir in enumerate(rep_dirs):
@@ -207,18 +209,18 @@ def plot_all_reps(run_dir, save_fig=False):
 
     # Average out the scores from all of the repeats,
     # giving a mean of the scores at each frame of the trajectory
-    averagedCompScore = np.array([ np.mean(CompScores[:,i]) for i in range(0,99) ])
-    averagedPoseScore = [ np.mean(PoseScores[:,i]) for i in range(0,99) ]
-    averagedContactScore = [ np.mean(ContactScores[:,i]) for i in range(0,99) ]
+    averagedCompScore = np.array([ np.mean(CompScores[:,i]) for i in range(n_frames) ])
+    averagedPoseScore = [ np.mean(PoseScores[:,i]) for i in range(n_frames) ]
+    averagedContactScore = [ np.mean(ContactScores[:,i]) for i in range(n_frames) ]
     # Get the standard deviation for the CompScore
-    CompScore_stddev = np.array([ np.std(CompScores[:,i]) for i in range(0,99) ])
+    CompScore_stddev = np.array([ np.std(CompScores[:,i]) for i in range(n_frames) ])
     # Get the standard deviation for the PoseScore
-    PoseScore_stddev = np.array([ np.std(PoseScores[:,i]) for i in range(0,99) ])
+    PoseScore_stddev = np.array([ np.std(PoseScores[:,i]) for i in range(n_frames) ])
     # Get the standard deviation for the ContactScore
-    ContactScore_stddev = np.array([ np.std(ContactScores[:,i]) for i in range(0,99) ])
-    
-    # An array of time steps for plotting the x axis
-    time_sequence = np.linspace(0,10,99)
+    ContactScore_stddev = np.array([ np.std(ContactScores[:,i]) for i in range(n_frames) ])
+
+    # Time axis: 100 ps per frame (trajectory written every 100 ps)
+    time_sequence = np.linspace(0, n_frames * 0.1, n_frames)
 
     fig, (ax1, ax2, ax3) = plt.subplots(nrows=1, ncols=3,
                                         figsize = (13,4))

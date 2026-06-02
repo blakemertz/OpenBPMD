@@ -1,20 +1,30 @@
 # OpenMM
-try:
-    from simtk.openmm import *
-    from simtk.openmm.app import *
-    from simtk.unit import *
-    from simtk.openmm.app.metadynamics import *
-except ImportError or ModuleNotFoundError:
-    from openmm import *
-    from openmm.app import *
-    from openmm.unit import *
-    from openmm.app.metadynamics import *
+from openmm import *
+from openmm.app import *
+from openmm.unit import *
+from openmm.app.metadynamics import *
 
 # The rest
 import numpy as np
 import mdtraj as md
 import MDAnalysis as mda
 import os
+
+
+def _get_platform():
+    """Return the fastest available OpenMM platform and its precision properties."""
+    for name in ('CUDA', 'OpenCL', 'CPU'):
+        try:
+            platform = Platform.getPlatformByName(name)
+            if name == 'CUDA':
+                return platform, {'CudaPrecision': 'mixed'}
+            elif name == 'OpenCL':
+                return platform, {'OpenCLPrecision': 'mixed'}
+            else:
+                return platform, {}
+        except Exception:
+            continue
+    raise RuntimeError("No OpenMM platform available.")
 
 
 # TODO: add default types
@@ -50,9 +60,8 @@ def minimize(
         constraints=HBonds,
     )
 
-    # Define platform properties
-    platform = Platform.getPlatformByName('CUDA')
-    properties = {'CudaPrecision': 'mixed'}
+    # Select fastest available platform
+    platform, properties = _get_platform()
 
     # Set up the simulation parameters
     # Langevin integrator at 300 K w/ 1 ps^-1 friction coefficient
@@ -157,8 +166,7 @@ def equilibrate(
     integrator = LangevinIntegrator(
         300 * kelvin, 1 / picosecond, 0.002 * picoseconds
     )
-    platform = Platform.getPlatformByName('CUDA')
-    properties = {'CudaPrecision': 'mixed'}
+    platform, properties = _get_platform()
     sim = Simulation(parm.topology, system, integrator,
                      platform, properties)
     sim.context.setPositions(input_positions)
@@ -287,8 +295,7 @@ def produce(
     integrator = LangevinIntegrator(
         300 * kelvin, 1.0 / picosecond, 0.004 * picoseconds
     )
-    platform = Platform.getPlatformByName('CUDA')
-    properties = {'CudaPrecision': 'mixed'}
+    platform, properties = _get_platform()
 
     simulation = Simulation(parm.topology, system, integrator, platform,
                             properties)
@@ -306,16 +313,17 @@ def produce(
                                 remainingTime=True, speed=True,
                                 totalSteps=steps, separator=','))  # every 1 ns
 
-    colvar_array = np.array([meta.getCollectiveVariables(simulation)])
-    for i in range(0, int(steps), 500):
-        if i % 25000 == 0:
-            # log the stored COLVAR every 100ps
-            np.save(os.path.join(write_dir,'COLVAR.npy'), colvar_array)
+    n_iters = int(steps) // 500
+    initial_cvs = meta.getCollectiveVariables(simulation)
+    colvar_array = np.zeros((n_iters + 1, len(initial_cvs)))
+    colvar_array[0] = initial_cvs
+    for it, step_start in enumerate(range(0, int(steps), 500)):
+        if step_start % 25000 == 0:
+            # log the stored COLVAR every 100 ps
+            np.save(os.path.join(write_dir, 'COLVAR.npy'), colvar_array[:it + 1])
         meta.step(simulation, 500)
-        current_cvs = meta.getCollectiveVariables(simulation)
-        # record the CVs every 2 ps
-        colvar_array = np.append(colvar_array, [current_cvs], axis=0)
-    np.save(os.path.join(write_dir,'COLVAR.npy'), colvar_array)
+        colvar_array[it + 1] = meta.getCollectiveVariables(simulation)
+    np.save(os.path.join(write_dir, 'COLVAR.npy'), colvar_array)
 
     # center everything using MDTraj, to fix any PBC imaging issues
     # mdtraj can't use GMX TOP, so we have to specify the GRO file instead
