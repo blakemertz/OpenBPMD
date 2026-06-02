@@ -370,7 +370,7 @@ def grand_equilibrate(
     grand_eq_file_name : str
         Name of the output PDB file with GCMC-equilibrated waters.
     """
-    # Load topology from parm file, positions from the equilibrated PDB
+    # Load topology and coordinates
     if structure_file.endswith('.gro'):
         box_vectors = GromacsGroFile(structure_file).getPeriodicBoxVectors()
         parm = GromacsTopFile(parm_file, periodicBoxVectors=box_vectors)
@@ -379,33 +379,91 @@ def grand_equilibrate(
 
     coords = PDBFile(eq_pdb)
 
-    # Add ghost TIP3P waters to topology BEFORE createSystem
+    # Create the OpenMM system from the ORIGINAL prmtop/top BEFORE adding ghosts.
+    # AmberPrmtopFile/GromacsTopFile.createSystem() use their own internal
+    # topology, which already includes all ligand parameters from the input
+    # parameter file — no XML force field look-up required.
+    system = parm.createSystem(
+        nonbondedMethod=PME,
+        nonbondedCutoff=1*nanometers,
+        constraints=HBonds,
+    )
+
+    # Augment the topology and positions with ghost TIP3P waters.
+    # grand.utils.add_ghosts() appends HOH residues to the topology and places
+    # them at random positions within the simulation box.
     topology, positions, ghost_resids = grand.utils.add_ghosts(
         parm.topology, coords.positions,
         ff='tip3p', n=15,
         pdb=os.path.join(out_dir, 'gcmc-extra-wats.pdb')
     )
 
-    # Build system on the ghost-augmented topology using standard OpenMM FF
-    # (AmberPrmtopFile.createSystem() uses its own internal topology and
-    # cannot accept ghost-augmented topologies, so we use ForceField instead)
-    if structure_file.endswith('.gro'):
-        # For GROMACS input, fall back to parmed to extract a usable FF
-        import parmed
-        pmd_struct = parmed.load_file(parm_file, xyz=structure_file)
-        system = pmd_struct.createSystem(
-            nonbondedMethod=PME,
-            nonbondedCutoff=1*nanometers,
-            constraints=HBonds,
+    # Extend the OpenMM system to include the ghost water particles.
+    # We read mass, charge, sigma, epsilon, and constraint distances directly
+    # from an existing water in the system — no hardcoded force field values.
+    nonbonded = None
+    for i in range(system.getNumForces()):
+        if isinstance(system.getForce(i), NonbondedForce):
+            nonbonded = system.getForce(i)
+            break
+
+    # Extract TIP3P parameters and intra-water constraint distances from the
+    # first water molecule already present in the parameterised system.
+    wat_params = []       # [(mass, charge, sigma, epsilon), ...] one per atom
+    wat_constraints = []  # [(local_idx_a, local_idx_b, distance), ...]
+    for residue in parm.topology.residues():
+        if residue.name in ('WAT', 'HOH', 'SOL'):
+            wat_atoms = list(residue.atoms())
+            atom_indices = {a.index for a in wat_atoms}
+            local_map = {a.index: i for i, a in enumerate(wat_atoms)}
+            for atom in wat_atoms:
+                mass = system.getParticleMass(atom.index)
+                charge, sigma, epsilon = nonbonded.getParticleParameters(atom.index)
+                wat_params.append((mass, charge, sigma, epsilon))
+            for k in range(system.getNumConstraints()):
+                p1, p2, dist = system.getConstraintParameters(k)
+                if p1 in atom_indices and p2 in atom_indices:
+                    wat_constraints.append((local_map[p1], local_map[p2], dist))
+            break
+
+    if not wat_params:
+        raise ValueError(
+            "No water molecules (WAT/HOH/SOL) found in the parameter file. "
+            "grand_equilibrate() requires an explicitly solvated system."
         )
-    else:
-        ff = ForceField('amber14-all.xml', 'amber14/tip3p.xml')
-        system = ff.createSystem(
-            topology,
-            nonbondedMethod=PME,
-            nonbondedCutoff=1*nanometers,
-            constraints=HBonds,
-        )
+
+    # Add one set of ghost particles per ghost residue
+    for ghost_resid in ghost_resids:
+        # Locate ghost atoms in the augmented topology
+        ghost_atoms = []
+        for resid, residue in enumerate(topology.residues()):
+            if resid == ghost_resid:
+                ghost_atoms = list(residue.atoms())
+                break
+
+        # Register particles and nonbonded parameters
+        for i, atom in enumerate(ghost_atoms):
+            mass, charge, sigma, epsilon = wat_params[i]
+            system.addParticle(mass)
+            nonbonded.addParticle(charge, sigma, epsilon)
+
+        # Reproduce the same intra-water constraints as the template water
+        for local_a, local_b, dist in wat_constraints:
+            system.addConstraint(
+                ghost_atoms[local_a].index,
+                ghost_atoms[local_b].index,
+                dist,
+            )
+
+        # Exclude intra-water nonbonded interactions (1-2 and 1-3 pairs)
+        for i in range(len(ghost_atoms)):
+            for j in range(i + 1, len(ghost_atoms)):
+                nonbonded.addException(
+                    ghost_atoms[i].index, ghost_atoms[j].index,
+                    0 * elementary_charge**2,
+                    1 * nanometers,
+                    0 * kilojoules_per_mole,
+                )
 
     # Find the first heavy atom of the ligand to define the GCMC sphere centre
     ref_atoms = []
