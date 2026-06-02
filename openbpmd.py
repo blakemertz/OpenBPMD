@@ -67,6 +67,9 @@ def main(args):
         Number of repeat OpenBPMD simulations to run in series.
     args.hill_height : float, default=0.3
         Size of the metadynamical hill, in kcal/mol.
+    args.no_grand : bool, default=False
+        Skip GCMC water equilibration. When False (default), grand_equilibrate()
+        runs between equilibrate() and the production replicas.
     """
     if not os.path.isdir(f'{args.output}'):
         os.mkdir(f'{args.output}')
@@ -87,17 +90,34 @@ def main(args):
         openbpmd.simulation.equilibrate(
             min_pdb, args.parameters, args.structure, args.output, eq_file_name
         )
-    eq_pdb = os.path.join(args.output,eq_file_name)
-    cent_eq_pdb = os.path.join(args.output,'centred_'+eq_file_name)
-    if os.path.isfile(eq_pdb) and not os.path.isfile(cent_eq_pdb):
-        # mdtraj can't use GMX TOP, so we have to specify the GRO file instead
-        if args.structure.endswith('.gro'):
-            mdtraj_top = args.structure
-        else:
-            mdtraj_top = args.parameters
-        mdu = md.load(eq_pdb, top=mdtraj_top)
+    eq_pdb = os.path.join(args.output, eq_file_name)
+
+    # mdtraj can't use GMX TOP, so we have to specify the GRO file instead
+    if args.structure.endswith('.gro'):
+        mdtraj_top = args.structure
+    else:
+        mdtraj_top = args.parameters
+
+    # Grand GCMC water equilibration
+    if not args.no_grand:
+        grand_eq_file_name = 'grand_equil_system.pdb'
+        grand_eq_pdb = os.path.join(args.output, grand_eq_file_name)
+        if not os.path.isfile(grand_eq_pdb):
+            print("Running GCMC water equilibration...")
+            openbpmd.simulation.grand_equilibrate(
+                eq_pdb, args.parameters, args.structure,
+                args.lig_resname, args.output, grand_eq_file_name
+            )
+        prod_pdb = grand_eq_pdb
+        cent_prod_pdb = os.path.join(args.output, 'centred_' + grand_eq_file_name)
+    else:
+        prod_pdb = eq_pdb
+        cent_prod_pdb = os.path.join(args.output, 'centred_' + eq_file_name)
+
+    if os.path.isfile(prod_pdb) and not os.path.isfile(cent_prod_pdb):
+        mdu = md.load(prod_pdb, top=mdtraj_top)
         mdu.image_molecules()
-        mdu.save_pdb(cent_eq_pdb)
+        mdu.save_pdb(cent_prod_pdb)
 
     # Run NREPS number of production simulations
     for idx in range(0, args.nreps):
@@ -109,18 +129,18 @@ def main(args):
             continue
         
         openbpmd.simulation.produce(
-            args.output, idx, args.lig_resname, eq_pdb, args.parameters,
+            args.output, idx, args.lig_resname, prod_pdb, args.parameters,
             args.structure, args.hill_height, 10
         )
-                
+
         trj_name = os.path.join(rep_dir,'trj.dcd')
-                
+
         PoseScoreArr = openbpmd.analysis.get_pose_score(
-            cent_eq_pdb, trj_name, args.lig_resname
+            cent_prod_pdb, trj_name, args.lig_resname
         )
 
         ContactScoreArr = openbpmd.analysis.get_contact_score(
-            cent_eq_pdb, trj_name, args.lig_resname
+            cent_prod_pdb, trj_name, args.lig_resname
         )
 
         # Calculate the CompScore at every frame
@@ -161,6 +181,8 @@ if __name__ == "__main__":
                         help="number of OpenBPMD repeats (default: %(default)i)")
     parser.add_argument("-hill_height", type=float, default=0.3,
                         help="the hill height in kcal/mol (default: %(default)f)")
+    parser.add_argument("--no-grand", action='store_true', default=False,
+                        help="skip GCMC water equilibration with grand (default: False)")
 
     args = parser.parse_args()
     main(args)

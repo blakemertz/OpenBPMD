@@ -8,6 +8,8 @@ from openmm.app.metadynamics import *
 import numpy as np
 import mdtraj as md
 import MDAnalysis as mda
+import grand
+from grand.samplers import StandardGCMCSphereSampler
 import os
 
 
@@ -334,5 +336,192 @@ def produce(
     mdu = md.load(trj_name, top=mdtraj_top)
     mdu.image_molecules()
     mdu.save(trj_name)
+
+    return None
+
+
+def grand_equilibrate(
+    eq_pdb, parm_file, structure_file, lig_resname, out_dir, grand_eq_file_name
+):
+    """Run Grand Canonical Monte Carlo (GCMC) water equilibration using the
+    three-stage protocol from Lukauskis et al. 2022. Correctly places
+    crystallographic bridging waters in the binding pocket before production.
+
+    Stages:
+        1a. 10,000 pure GCMC moves (NVT)
+        1b. 1 ps interleaved GCMC/MD (100 iterations of 1,000 moves + 5 steps)
+        2.  500 ps NPT MD to re-equilibrate box volume
+        3.  500 ps interleaved GCMC/MD at new volume (100,000 total GCMC moves)
+
+    Writes 'grand_equil_system.pdb' (or grand_eq_file_name) to out_dir.
+
+    Parameters
+    ----------
+    eq_pdb : str
+        Path to the NVT-equilibrated PDB (output of equilibrate()).
+    parm_file : str
+        Parameter/topology file (.prm7 or .top).
+    structure_file : str
+        Coordinate file (.rst7 or .gro), used only to detect Amber vs GROMACS.
+    lig_resname : str
+        Residue name of the ligand.
+    out_dir : str
+        Directory to write output files.
+    grand_eq_file_name : str
+        Name of the output PDB file with GCMC-equilibrated waters.
+    """
+    # Load topology from parm file, positions from the equilibrated PDB
+    if structure_file.endswith('.gro'):
+        box_vectors = GromacsGroFile(structure_file).getPeriodicBoxVectors()
+        parm = GromacsTopFile(parm_file, periodicBoxVectors=box_vectors)
+    else:
+        parm = AmberPrmtopFile(parm_file)
+
+    coords = PDBFile(eq_pdb)
+
+    # Add ghost TIP3P waters to topology BEFORE createSystem
+    topology, positions, ghost_resids = grand.utils.add_ghosts(
+        parm.topology, coords.positions,
+        ff='tip3p', n=15,
+        pdb=os.path.join(out_dir, 'gcmc-extra-wats.pdb')
+    )
+
+    # Build system on the ghost-augmented topology using standard OpenMM FF
+    # (AmberPrmtopFile.createSystem() uses its own internal topology and
+    # cannot accept ghost-augmented topologies, so we use ForceField instead)
+    if structure_file.endswith('.gro'):
+        # For GROMACS input, fall back to parmed to extract a usable FF
+        import parmed
+        pmd_struct = parmed.load_file(parm_file, xyz=structure_file)
+        system = pmd_struct.createSystem(
+            nonbondedMethod=PME,
+            nonbondedCutoff=1*nanometers,
+            constraints=HBonds,
+        )
+    else:
+        ff = ForceField('amber14-all.xml', 'amber14/tip3p.xml')
+        system = ff.createSystem(
+            topology,
+            nonbondedMethod=PME,
+            nonbondedCutoff=1*nanometers,
+            constraints=HBonds,
+        )
+
+    # Find the first heavy atom of the ligand to define the GCMC sphere centre
+    ref_atoms = []
+    for residue in topology.residues():
+        if residue.name == lig_resname:
+            for atom in residue.atoms():
+                if not atom.name.startswith('H'):
+                    ref_atoms.append({
+                        'name': atom.name,
+                        'resname': lig_resname,
+                        'resid': residue.id,
+                    })
+                    break
+            break
+    if not ref_atoms:
+        raise ValueError(
+            f"Ligand residue '{lig_resname}' not found in topology. "
+            "Check -lig_resname."
+        )
+
+    # Instantiate the GCMC sampler
+    gcmc_mover = StandardGCMCSphereSampler(
+        system=system,
+        topology=topology,
+        temperature=300*kelvin,
+        referenceAtoms=ref_atoms,
+        sphereRadius=4.0*angstroms,
+        excessChemicalPotential=-6.09*kilocalories_per_mole,
+        standardVolume=30.345*angstroms**3,
+        ghostFile=os.path.join(out_dir, 'gcmc-ghost-wats.txt'),
+        log=os.path.join(out_dir, 'gcmc.log'),
+        overwrite=True,
+    )
+
+    platform, properties = _get_platform()
+
+    # ------------------------------------------------------------------ #
+    # Stage 1: GCMC equilibration of binding site waters (NVT)            #
+    # ------------------------------------------------------------------ #
+    integrator = LangevinIntegrator(300*kelvin, 1/picosecond, 0.002*picoseconds)
+    simulation = Simulation(topology, system, integrator, platform, properties)
+    simulation.context.setPositions(positions)
+    simulation.context.setVelocitiesToTemperature(300*kelvin)
+    simulation.context.setPeriodicBoxVectors(*topology.getPeriodicBoxVectors())
+
+    gcmc_mover.initialise(simulation.context, ghost_resids)
+    # Clear any waters currently in the sphere to start fresh
+    gcmc_mover.deleteWatersInGCMCSphere()
+
+    # Stage 1a: 10,000 pure GCMC moves
+    print("  GCMC stage 1a: 10,000 insertion/deletion moves...")
+    gcmc_mover.move(simulation.context, 10000)
+
+    # Stage 1b: 1 ps interleaved GCMC/MD (100 × [1,000 moves + 5 MD steps])
+    print("  GCMC stage 1b: 1 ps interleaved GCMC/MD...")
+    for i in range(100):
+        gcmc_mover.move(simulation.context, 1000)
+        gcmc_mover.report(simulation)
+        simulation.step(5)  # 5 × 2 fs = 10 fs
+
+    # ------------------------------------------------------------------ #
+    # Stage 2: 500 ps NPT MD to re-equilibrate box volume                 #
+    # ------------------------------------------------------------------ #
+    print("  GCMC stage 2: 500 ps NPT equilibration...")
+    system.addForce(MonteCarloBarostat(1*bar, 300*kelvin, 25))
+
+    integrator2 = LangevinIntegrator(300*kelvin, 1/picosecond, 0.002*picoseconds)
+    simulation2 = Simulation(topology, system, integrator2, platform, properties)
+    state = simulation.context.getState(
+        getPositions=True, getVelocities=True, enforcePeriodicBox=True
+    )
+    simulation2.context.setPositions(state.getPositions())
+    simulation2.context.setVelocities(state.getVelocities())
+    simulation2.context.setPeriodicBoxVectors(*state.getPeriodicBoxVectors())
+    simulation2.step(250000)  # 500 ps
+
+    # ------------------------------------------------------------------ #
+    # Stage 3: 100,000 GCMC moves over 500 ps at new box volume           #
+    # ------------------------------------------------------------------ #
+    print("  GCMC stage 3: 500 ps interleaved GCMC/MD at new volume...")
+
+    # Remove the barostat before stage 3 (back to NVT)
+    for i in range(system.getNumForces()):
+        if isinstance(system.getForce(i), MonteCarloBarostat):
+            system.removeForce(i)
+            break
+
+    integrator3 = LangevinIntegrator(300*kelvin, 1/picosecond, 0.002*picoseconds)
+    simulation3 = Simulation(topology, system, integrator3, platform, properties)
+    state2 = simulation2.context.getState(
+        getPositions=True, getVelocities=True, enforcePeriodicBox=True
+    )
+    simulation3.context.setPositions(state2.getPositions())
+    simulation3.context.setVelocities(state2.getVelocities())
+    simulation3.context.setPeriodicBoxVectors(*state2.getPeriodicBoxVectors())
+
+    # Re-initialise sampler with current ghost list at new box dimensions
+    gcmc_mover.initialise(simulation3.context, gcmc_mover.getWaterStatusResids(0))
+
+    # 500 iterations × (500 MD steps + 200 GCMC moves) = 500 ps / 100k moves
+    for i in range(500):
+        simulation3.step(500)
+        gcmc_mover.move(simulation3.context, 200)
+        gcmc_mover.report(simulation3)
+
+    # ------------------------------------------------------------------ #
+    # Strip ghost waters and write the output PDB                         #
+    # ------------------------------------------------------------------ #
+    ghost_resids_final = gcmc_mover.getWaterStatusResids(0)
+    final_positions = simulation3.context.getState(
+        getPositions=True, enforcePeriodicBox=True
+    ).getPositions()
+    grand.utils.remove_ghosts(
+        topology, final_positions,
+        ghosts=ghost_resids_final,
+        pdb=os.path.join(out_dir, grand_eq_file_name)
+    )
 
     return None
