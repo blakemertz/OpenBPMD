@@ -465,7 +465,10 @@ def grand_equilibrate(
                     0 * kilojoules_per_mole,
                 )
 
-    # Find the first heavy atom of the ligand to define the GCMC sphere centre
+    # Use all heavy atoms of the ligand as reference atoms so that grand
+    # centres the GCMC sphere on the ligand COM rather than a single atom.
+    # Centering on one atom places the sphere deep inside the ligand where
+    # almost no free volume exists for water insertion.
     ref_atoms = []
     for residue in topology.residues():
         if residue.name == lig_resname:
@@ -476,7 +479,6 @@ def grand_equilibrate(
                         'resname': lig_resname,
                         'resid': residue.id,
                     })
-                    break
             break
     if not ref_atoms:
         raise ValueError(
@@ -490,7 +492,7 @@ def grand_equilibrate(
         topology=topology,
         temperature=300*kelvin,
         referenceAtoms=ref_atoms,
-        sphereRadius=4.0*angstroms,
+        sphereRadius=5.0*angstroms,
         excessChemicalPotential=-6.09*kilocalories_per_mole,
         standardVolume=30.345*angstroms**3,
         ghostFile=os.path.join(out_dir, 'gcmc-ghost-wats.txt'),
