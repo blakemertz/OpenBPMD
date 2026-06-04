@@ -115,7 +115,9 @@ def main(args):
         cent_prod_pdb = os.path.join(args.output, 'centred_' + eq_file_name)
 
     if os.path.isfile(prod_pdb) and not os.path.isfile(cent_prod_pdb):
-        mdu = md.load(prod_pdb, top=mdtraj_top)
+        # Use the PDB as its own topology: grand_equil_system.pdb may have
+        # extra atoms (GCMC-inserted waters) that don't match the prmtop.
+        mdu = md.load(prod_pdb, top=prod_pdb)
         mdu.image_molecules()
         mdu.save_pdb(cent_prod_pdb)
 

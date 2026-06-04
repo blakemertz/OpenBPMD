@@ -254,9 +254,14 @@ def produce(
         constraints=HBonds,
         hydrogenMass=4*amu
     )
-    # get the atom positions for the system from the equilibrated
-    # system
-    input_positions = PDBFile(eq_pdb).getPositions()
+    # get the atom positions for the system from the equilibrated system.
+    # When grand_equilibrate() inserted new waters, the PDB may have more
+    # atoms than the prmtop. Grand appends ghosts at the end of the
+    # topology, so truncating to prmtop atom count gives the original atoms
+    # in the correct order, with inserted GCMC waters at the end discarded.
+    input_positions_all = PDBFile(eq_pdb).getPositions()
+    n_parm_atoms = parm.topology.getNumAtoms()
+    input_positions = input_positions_all[:n_parm_atoms]
 
     # Add an 'empty' flat-bottom restraint to fix the issue with PBC.
     # Without one, RMSDForce object fails to account for PBC.
@@ -590,13 +595,21 @@ def grand_equilibrate(
     # ------------------------------------------------------------------ #
     # Strip ghost waters and write the output PDB                         #
     # ------------------------------------------------------------------ #
-    ghost_resids_final = gcmc_mover.getWaterStatusResids(0)
+    # Only remove ghost slots that were never inserted (still lambda=0).
+    # Do NOT remove original system waters that were temporarily deleted
+    # during GCMC — those would reduce the output PDB below the original
+    # prmtop atom count and break downstream topology matching.
+    # Ghost slots that were successfully inserted (lambda=1) remain in
+    # the output PDB as real waters at their GCMC-placed positions.
+    ghost_resids_to_remove = list(
+        set(ghost_resids) & set(gcmc_mover.getWaterStatusResids(0))
+    )
     final_positions = simulation3.context.getState(
         getPositions=True, enforcePeriodicBox=True
     ).getPositions()
     grand.utils.remove_ghosts(
         topology, final_positions,
-        ghosts=ghost_resids_final,
+        ghosts=ghost_resids_to_remove,
         pdb=os.path.join(out_dir, grand_eq_file_name)
     )
 
