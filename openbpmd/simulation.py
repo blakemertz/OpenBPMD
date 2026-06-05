@@ -298,15 +298,36 @@ def produce(
                         250, biasDir=write_dir,
                         saveFrequency=250000)
 
+    # ------------------------------------------------------------------ #
+    # Pre-production: minimise then short NVT equilibration               #
+    # ------------------------------------------------------------------ #
+    # grand_equilibrate() may leave the binding site with newly placed or
+    # rearranged waters that have not been locally relaxed under the full
+    # prmtop force field.  Starting 4 fs metadynamics directly from such
+    # coordinates causes NaN in RMSDForce within the first few steps.
+    platform, properties = _get_platform()
+
+    integrator_pre = LangevinIntegrator(300*kelvin, 1/picosecond, 0.002*picoseconds)
+    sim_pre = Simulation(parm.topology, system, integrator_pre, platform, properties)
+    sim_pre.context.setPositions(input_positions)
+    sim_pre.minimizeEnergy(maxIterations=500)
+    sim_pre.context.setVelocitiesToTemperature(300*kelvin)
+    sim_pre.step(50000)  # 100 ps NVT at 2 fs
+
+    pre_state = sim_pre.context.getState(
+        getPositions=True, getVelocities=True, enforcePeriodicBox=True
+    )
+
     # Set up and run metadynamics
     integrator = LangevinIntegrator(
         300 * kelvin, 1.0 / picosecond, 0.004 * picoseconds
     )
-    platform, properties = _get_platform()
 
     simulation = Simulation(parm.topology, system, integrator, platform,
                             properties)
-    simulation.context.setPositions(input_positions)
+    simulation.context.setPositions(pre_state.getPositions())
+    simulation.context.setVelocities(pre_state.getVelocities())
+    simulation.context.setPeriodicBoxVectors(*pre_state.getPeriodicBoxVectors())
 
     trj_name = os.path.join(write_dir, 'trj.dcd')
 
@@ -324,11 +345,40 @@ def produce(
     initial_cvs = meta.getCollectiveVariables(simulation)
     colvar_array = np.zeros((n_iters + 1, len(initial_cvs)))
     colvar_array[0] = initial_cvs
+
+    # Adaptive timestep: if a NaN is encountered, halve the timestep and
+    # retry from a saved checkpoint. Minimum timestep is 0.5 fs.
+    dt_ps = 0.004          # current timestep in ps (start at 4 fs)
+    dt_min_ps = 0.0005     # floor: 0.5 fs
+
     for it, step_start in enumerate(range(0, int(steps), 500)):
         if step_start % 25000 == 0:
             # log the stored COLVAR every 100 ps
             np.save(os.path.join(write_dir, 'COLVAR.npy'), colvar_array[:it + 1])
-        meta.step(simulation, 500)
+
+        # Checkpoint before each batch so we can roll back on NaN
+        chk = simulation.context.getState(
+            getPositions=True, getVelocities=True, enforcePeriodicBox=True
+        )
+
+        while True:
+            try:
+                meta.step(simulation, 500)
+                break
+            except Exception as e:
+                if 'NaN' in str(e) and dt_ps > dt_min_ps:
+                    dt_ps = max(dt_ps / 2.0, dt_min_ps)
+                    integrator.setStepSize(dt_ps * picoseconds)
+                    print(f"  NaN detected; reducing timestep to {dt_ps*1000:.1f} fs and retrying...")
+                    simulation.context.setPositions(chk.getPositions())
+                    simulation.context.setVelocities(chk.getVelocities())
+                    simulation.context.setPeriodicBoxVectors(
+                        *chk.getPeriodicBoxVectors()
+                    )
+                    simulation.context.setVelocitiesToTemperature(300*kelvin)
+                else:
+                    raise
+
         colvar_array[it + 1] = meta.getCollectiveVariables(simulation)
     np.save(os.path.join(write_dir, 'COLVAR.npy'), colvar_array)
 
