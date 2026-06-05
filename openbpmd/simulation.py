@@ -29,6 +29,82 @@ def _get_platform():
     raise RuntimeError("No OpenMM platform available.")
 
 
+def _extend_system_with_tip3p(system, parm_topology, n_waters):
+    """Add n_waters TIP3P water molecules to an existing OpenMM System.
+
+    Parameters are copied from the first WAT/HOH/SOL residue already present
+    in parm_topology, so no hardcoded force-field values are needed.  The new
+    particles are appended to the end of the System particle list, which must
+    match the atom ordering of whatever topology/PDB is used for the Simulation.
+
+    Parameters
+    ----------
+    system : openmm.System
+        System to extend in-place.
+    parm_topology : openmm.app.Topology
+        Topology whose first water residue provides the parameter template
+        (mass, charge, sigma, epsilon, constraint distances).
+    n_waters : int
+        Number of TIP3P waters to add.
+
+    Returns
+    -------
+    new_indices : list of tuple
+        Particle index triples [(O, H1, H2), ...] for each added water.
+    """
+    nonbonded = None
+    for i in range(system.getNumForces()):
+        if isinstance(system.getForce(i), NonbondedForce):
+            nonbonded = system.getForce(i)
+            break
+    if nonbonded is None:
+        raise ValueError("No NonbondedForce found in system.")
+
+    wat_params = []
+    wat_constraints = []
+    for residue in parm_topology.residues():
+        if residue.name in ('WAT', 'HOH', 'SOL'):
+            wat_atoms = list(residue.atoms())
+            atom_set = {a.index for a in wat_atoms}
+            local_map = {a.index: i for i, a in enumerate(wat_atoms)}
+            for atom in wat_atoms:
+                mass = system.getParticleMass(atom.index)
+                charge, sigma, epsilon = nonbonded.getParticleParameters(atom.index)
+                wat_params.append((mass, charge, sigma, epsilon))
+            for k in range(system.getNumConstraints()):
+                p1, p2, dist = system.getConstraintParameters(k)
+                if p1 in atom_set and p2 in atom_set:
+                    wat_constraints.append((local_map[p1], local_map[p2], dist))
+            break
+
+    if not wat_params:
+        raise ValueError(
+            "No water residue (WAT/HOH/SOL) found in parm_topology. "
+            "An explicitly solvated system is required."
+        )
+
+    new_indices = []
+    for _ in range(n_waters):
+        idx = []
+        for i in range(3):
+            mass, charge, sigma, epsilon = wat_params[i]
+            particle_idx = system.addParticle(mass)
+            nonbonded.addParticle(charge, sigma, epsilon)
+            idx.append(particle_idx)
+        for local_a, local_b, dist in wat_constraints:
+            system.addConstraint(idx[local_a], idx[local_b], dist)
+        for i in range(3):
+            for j in range(i + 1, 3):
+                nonbonded.addException(
+                    idx[i], idx[j],
+                    0 * elementary_charge**2,
+                    1 * nanometers,
+                    0 * kilojoules_per_mole,
+                )
+        new_indices.append(tuple(idx))
+    return new_indices
+
+
 # TODO: add default types
 def minimize(
     parm_file, structure_file, out_dir, min_file_name
@@ -254,14 +330,25 @@ def produce(
         constraints=HBonds,
         hydrogenMass=4*amu
     )
-    # get the atom positions for the system from the equilibrated system.
-    # When grand_equilibrate() inserted new waters, the PDB may have more
-    # atoms than the prmtop. Grand appends ghosts at the end of the
-    # topology, so truncating to prmtop atom count gives the original atoms
-    # in the correct order, with inserted GCMC waters at the end discarded.
+
+    # Load positions from the equilibrated PDB. If grand_equilibrate() retained
+    # inserted GCMC waters, the PDB has more atoms than the prmtop. Those extra
+    # atoms are TIP3P waters appended at the end by grand. Extend the OpenMM
+    # system with matching particles so the topology, system, and positions are
+    # all consistent, and the inserted bridging waters carry through to production.
     input_positions_all = PDBFile(eq_pdb).getPositions()
+    n_pdb_atoms = len(input_positions_all)
     n_parm_atoms = parm.topology.getNumAtoms()
-    input_positions = input_positions_all[:n_parm_atoms]
+    n_extra_waters = (n_pdb_atoms - n_parm_atoms) // 3
+
+    if n_extra_waters > 0:
+        _extend_system_with_tip3p(system, parm.topology, n_extra_waters)
+        # Use the PDB's own topology so particle count matches the extended system.
+        sim_topology = PDBFile(eq_pdb).topology
+        input_positions = input_positions_all
+    else:
+        sim_topology = parm.topology
+        input_positions = input_positions_all[:n_parm_atoms]
 
     # Add an 'empty' flat-bottom restraint to fix the issue with PBC.
     # Without one, RMSDForce object fails to account for PBC.
@@ -308,7 +395,7 @@ def produce(
     platform, properties = _get_platform()
 
     integrator_pre = LangevinIntegrator(300*kelvin, 1/picosecond, 0.002*picoseconds)
-    sim_pre = Simulation(parm.topology, system, integrator_pre, platform, properties)
+    sim_pre = Simulation(sim_topology, system, integrator_pre, platform, properties)
     sim_pre.context.setPositions(input_positions)
     sim_pre.minimizeEnergy(maxIterations=500)
     sim_pre.context.setVelocitiesToTemperature(300*kelvin)
@@ -323,7 +410,7 @@ def produce(
         300 * kelvin, 1.0 / picosecond, 0.004 * picoseconds
     )
 
-    simulation = Simulation(parm.topology, system, integrator, platform,
+    simulation = Simulation(sim_topology, system, integrator, platform,
                             properties)
     simulation.context.setPositions(pre_state.getPositions())
     simulation.context.setVelocities(pre_state.getVelocities())
@@ -454,71 +541,8 @@ def grand_equilibrate(
     )
 
     # Extend the OpenMM system to include the ghost water particles.
-    # We read mass, charge, sigma, epsilon, and constraint distances directly
-    # from an existing water in the system — no hardcoded force field values.
-    nonbonded = None
-    for i in range(system.getNumForces()):
-        if isinstance(system.getForce(i), NonbondedForce):
-            nonbonded = system.getForce(i)
-            break
-
-    # Extract TIP3P parameters and intra-water constraint distances from the
-    # first water molecule already present in the parameterised system.
-    wat_params = []       # [(mass, charge, sigma, epsilon), ...] one per atom
-    wat_constraints = []  # [(local_idx_a, local_idx_b, distance), ...]
-    for residue in parm.topology.residues():
-        if residue.name in ('WAT', 'HOH', 'SOL'):
-            wat_atoms = list(residue.atoms())
-            atom_indices = {a.index for a in wat_atoms}
-            local_map = {a.index: i for i, a in enumerate(wat_atoms)}
-            for atom in wat_atoms:
-                mass = system.getParticleMass(atom.index)
-                charge, sigma, epsilon = nonbonded.getParticleParameters(atom.index)
-                wat_params.append((mass, charge, sigma, epsilon))
-            for k in range(system.getNumConstraints()):
-                p1, p2, dist = system.getConstraintParameters(k)
-                if p1 in atom_indices and p2 in atom_indices:
-                    wat_constraints.append((local_map[p1], local_map[p2], dist))
-            break
-
-    if not wat_params:
-        raise ValueError(
-            "No water molecules (WAT/HOH/SOL) found in the parameter file. "
-            "grand_equilibrate() requires an explicitly solvated system."
-        )
-
-    # Add one set of ghost particles per ghost residue
-    for ghost_resid in ghost_resids:
-        # Locate ghost atoms in the augmented topology
-        ghost_atoms = []
-        for resid, residue in enumerate(topology.residues()):
-            if resid == ghost_resid:
-                ghost_atoms = list(residue.atoms())
-                break
-
-        # Register particles and nonbonded parameters
-        for i, atom in enumerate(ghost_atoms):
-            mass, charge, sigma, epsilon = wat_params[i]
-            system.addParticle(mass)
-            nonbonded.addParticle(charge, sigma, epsilon)
-
-        # Reproduce the same intra-water constraints as the template water
-        for local_a, local_b, dist in wat_constraints:
-            system.addConstraint(
-                ghost_atoms[local_a].index,
-                ghost_atoms[local_b].index,
-                dist,
-            )
-
-        # Exclude intra-water nonbonded interactions (1-2 and 1-3 pairs)
-        for i in range(len(ghost_atoms)):
-            for j in range(i + 1, len(ghost_atoms)):
-                nonbonded.addException(
-                    ghost_atoms[i].index, ghost_atoms[j].index,
-                    0 * elementary_charge**2,
-                    1 * nanometers,
-                    0 * kilojoules_per_mole,
-                )
+    # Parameters are read from the first water already in the system.
+    _extend_system_with_tip3p(system, parm.topology, len(ghost_resids))
 
     # Use all heavy atoms of the ligand as reference atoms so that grand
     # centres the GCMC sphere on the ligand COM rather than a single atom.
