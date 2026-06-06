@@ -129,13 +129,22 @@ def main(args):
 
         if os.path.isfile(os.path.join(rep_dir,'bpmd_results.csv')):
             continue
-        
-        openbpmd.simulation.produce(
-            args.output, idx, args.lig_resname, prod_pdb, args.parameters,
-            args.structure, args.hill_height, 10
-        )
 
         trj_name = os.path.join(rep_dir,'trj.dcd')
+
+        # Only run production if the DCD doesn't already exist.  This allows
+        # re-running after an analysis failure without redoing the simulation.
+        if not os.path.isfile(trj_name):
+            openbpmd.simulation.produce(
+                args.output, idx, args.lig_resname, prod_pdb, args.parameters,
+                args.structure, args.hill_height, 10
+            )
+
+        # Image the trajectory.  Use prod_pdb as its own topology so that any
+        # GCMC-inserted waters (which are not in the prmtop) are accounted for.
+        mdu_trj = md.load(trj_name, top=prod_pdb)
+        mdu_trj.image_molecules()
+        mdu_trj.save(trj_name)
 
         PoseScoreArr = openbpmd.analysis.get_pose_score(
             cent_prod_pdb, trj_name, args.lig_resname

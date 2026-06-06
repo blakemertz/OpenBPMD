@@ -469,16 +469,6 @@ def produce(
         colvar_array[it + 1] = meta.getCollectiveVariables(simulation)
     np.save(os.path.join(write_dir, 'COLVAR.npy'), colvar_array)
 
-    # center everything using MDTraj, to fix any PBC imaging issues
-    # mdtraj can't use GMX TOP, so we have to specify the GRO file instead
-    if structure_file.endswith('.gro'):
-        mdtraj_top = structure_file
-    else:
-        mdtraj_top = parm_file
-    mdu = md.load(trj_name, top=mdtraj_top)
-    mdu.image_molecules()
-    mdu.save(trj_name)
-
     return None
 
 
