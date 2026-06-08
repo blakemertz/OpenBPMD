@@ -87,14 +87,16 @@ These are the files passed to OpenBPMD with `-p` and `-s`.
 
 `antechamber` assigns GAFF2 atom types and AM1-BCC partial charges to the ligand. You need:
 
-- A clean PDB of the ligand alone (correct protonation state, no solvent)
+- A ligand structure file with explicit bond orders (SDF or mol2 preferred — see note below)
 - The ligand's net formal charge (integer)
 
 ```bash
-# Generate GAFF2 atom types and AM1-BCC charges
+# Preferred: convert SDF to mol2 with OpenBabel (preserves bond orders), then run antechamber
+obabel -isdf ligand.sdf -omol2 -O ligand_ob.mol2
+
 antechamber \
-    -i  ligand.pdb \
-    -fi pdb \
+    -i  ligand_ob.mol2 \
+    -fi mol2 \
     -o  ligand.mol2 \
     -fo mol2 \
     -c  bcc \
@@ -116,7 +118,13 @@ parmchk2 \
 | `-s 2` | Status level (print warnings) |
 | `-nc` | Net formal charge of the ligand |
 
-If `antechamber` fails with charge-calculation errors, ensure the input PDB has explicit
+> **Why not PDB input?** PDB format does not store bond orders. `antechamber` must infer
+> bond types from geometry alone, which fails for hypervalent atoms: sulfonyl (`S(=O)(=O)`),
+> sulfoxide, phosphate, nitro groups, etc. Using SDF or mol2 input avoids this entirely.
+> If your docking software exports SDF (Glide, Vina, GOLD), use SDF directly. If it exports
+> PDB, convert to mol2 first via OpenBabel: `obabel -ipdb ligand.pdb -omol2 -O ligand_ob.mol2`.
+
+If `antechamber` fails with charge-calculation errors, ensure the input structure has explicit
 hydrogens at the correct protonation state. Use `reduce` or `OpenBabel` to add hydrogens
 if needed.
 
@@ -425,6 +433,15 @@ The production loop is serial by default. To run replicas in parallel, launch mu
 ---
 
 ## Troubleshooting
+
+**`antechamber: Fatal Error! Cannot properly run bondtype` (sulfur or other hypervalent atom)**  
+`antechamber` failed to assign bond types because the input PDB has no bond-order information.
+This is common for sulfonyl (`S(=O)(=O)`), sulfoxide, phosphate, and nitro groups. Switch to
+mol2 or SDF input:
+```bash
+obabel -ipdb ligand.pdb -omol2 -O ligand_ob.mol2
+antechamber -i ligand_ob.mol2 -fi mol2 -o ligand.mol2 -fo mol2 -c bcc -s 2 -nc <charge>
+```
 
 **`ValueError: No template found for residue MOL`**  
 The force field cannot find parameters for the ligand. Ensure the `.prm7` file was generated
