@@ -101,7 +101,8 @@ antechamber \
     -fo mol2 \
     -c  bcc \
     -s  2 \
-    -nc <net_charge>   # e.g. 0 for neutral, -1 for singly charged anion
+    -nc <net_charge> \  # e.g. 0 for neutral, -1 for singly charged anion
+    -rn MOL             # set output residue name to MOL
 
 # Generate missing bonded parameters not in GAFF2
 parmchk2 \
@@ -117,6 +118,15 @@ parmchk2 \
 | `-c bcc` | AM1-BCC charge method (fast, adequate for docking rescoring) |
 | `-s 2` | Status level (print warnings) |
 | `-nc` | Net formal charge of the ligand |
+| `-rn MOL` | Output residue name written into the mol2 ATOM and SUBSTRUCTURE blocks |
+
+> **Why `-rn MOL` is required:** OpenBabel assigns the residue name `UNL` (unknown ligand)
+> when converting from SDF, because SDF has no residue name concept. This name propagates
+> into the `@<TRIPOS>ATOM` subst_name column and the `@<TRIPOS>SUBSTRUCTURE` block of the
+> output mol2 — the fields that tleap and antechamber actually use. Changing the
+> `@<TRIPOS>MOLECULE` name manually has no effect. The `-rn MOL` flag tells antechamber to
+> write `MOL` into both fields, ensuring the residue name in the final `.prm7` matches the
+> `-lig_resname MOL` argument passed to OpenBPMD.
 
 > **Why not PDB input?** PDB format does not store bond orders. `antechamber` must infer
 > bond types from geometry alone, which fails for hypervalent atoms: sulfonyl (`S(=O)(=O)`),
@@ -452,6 +462,14 @@ a system built from GROMACS topology files.
 The `-lig_resname` argument does not match the residue name in your parameter file. Check
 the residue name with:  
 `grep -m5 "^ATOM\|^HETATM" equil_system.pdb`
+
+If the ligand residue name appears as `UNL` instead of `MOL`, antechamber inherited the
+default residue name that OpenBabel assigns when converting from SDF (which has no residue
+name field). Rebuild the ligand mol2 with the `-rn MOL` flag:
+```bash
+antechamber -i ligand_ob.mol2 -fi mol2 -o ligand.mol2 -fo mol2 -c bcc -s 2 -nc <charge> -rn MOL
+```
+Then rebuild the solvated system with tleap.
 
 **GCMC acceptance rate is 0%**  
 The GCMC sphere (default 4 Å) may not overlap any water-accessible space around the ligand.
