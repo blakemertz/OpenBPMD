@@ -132,8 +132,17 @@ def main(args):
 
         trj_name = os.path.join(rep_dir,'trj.dcd')
 
-        # Only run production if the DCD doesn't already exist.  This allows
-        # re-running after an analysis failure without redoing the simulation.
+        # If a DCD exists but bpmd_results.csv does not, the job was interrupted
+        # mid-replica (e.g. wallclock timeout).  Validate the DCD by loading it;
+        # if it is truncated or corrupt, delete it and re-run production.
+        if os.path.isfile(trj_name):
+            try:
+                md.load(trj_name, top=prod_pdb)
+            except Exception:
+                print(f"rep_{idx}: DCD appears truncated or corrupt — removing "
+                      f"and re-running production.")
+                os.remove(trj_name)
+
         if not os.path.isfile(trj_name):
             openbpmd.simulation.produce(
                 args.output, idx, args.lig_resname, prod_pdb, args.parameters,

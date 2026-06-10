@@ -20,9 +20,10 @@
    - [Stage 5 — Scoring](#stage-5--scoring)
 6. [Complete Example: CDK2 System](#complete-example-cdk2-system)
 7. [Output Files](#output-files)
-8. [Interpreting Results](#interpreting-results)
-9. [Performance Notes](#performance-notes)
-10. [Troubleshooting](#troubleshooting)
+8. [How Results Are Collated](#how-results-are-collated)
+9. [Interpreting Results](#interpreting-results)
+10. [Performance Notes](#performance-notes)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -371,26 +372,70 @@ The stable pose should yield a lower (more negative) CompScore than the unstable
 
 ## Output Files
 
+### Preparation and equilibration
+
 | File | Location | Description |
 |------|----------|-------------|
 | `minimized_system.pdb` | `output_dir/` | Energy-minimized structure |
 | `equil_system.pdb` | `output_dir/` | NVT-equilibrated structure |
-| `grand_equil_system.pdb` | `output_dir/` | GCMC water-equilibrated structure |
-| `centred_grand_equil_system.pdb` | `output_dir/` | PBC-imaged version for analysis |
+| `grand_equil_system.pdb` | `output_dir/` | GCMC water-equilibrated structure (starting point for all replicas) |
+| `centred_grand_equil_system.pdb` | `output_dir/` | PBC-imaged version of the above, used as the MDAnalysis topology reference |
 | `gcmc.log` | `output_dir/` | GCMC acceptance rates and N(water) per step |
-| `gcmc-ghost-wats.txt` | `output_dir/` | Ghost water residue IDs per GCMC frame |
-| `gcmc-extra-wats.pdb` | `output_dir/` | Ghost-augmented topology PDB |
-| `trj.dcd` | `output_dir/rep_N/` | Metadynamics trajectory |
-| `COLVAR.npy` | `output_dir/rep_N/` | Ligand RMSD time series (nm) |
-| `sim_log.csv` | `output_dir/rep_N/` | Simulation log (temperature, speed) |
-| `bpmd_results.csv` | `output_dir/rep_N/` | Per-frame PoseScore, ContactScore, CompScore |
-| `results.csv` | `output_dir/` | Final averaged scores across all replicas |
+| `gcmc-ghost-wats.txt` | `output_dir/` | Ghost water residue IDs tracked per GCMC frame |
+| `gcmc-extra-wats.pdb` | `output_dir/` | Ghost-augmented topology PDB (pre-GCMC, for visualisation) |
+
+### Per-replica outputs (`output_dir/rep_N/`)
+
+Each of the N replicas (default 10) produces its own subdirectory:
+
+| File | Description |
+|------|-------------|
+| `trj.dcd` | Metadynamics trajectory — 100 frames, one per 100 ps (10 ns total) |
+| `COLVAR.npy` | Instantaneous ligand RMSD deposited as the metadynamics CV, one value per hill (every 1 ps, 10,000 values) |
+| `sim_log.csv` | Simulation log: step, time, temperature, speed |
+| `bpmd_results.csv` | Per-frame scores for this replica — 99 rows × 3 columns (see below) |
+
+`bpmd_results.csv` columns:
+
+| Column | Definition |
+|--------|-----------|
+| `PoseScore` | Ligand heavy-atom RMSD (Å) relative to frame 0, after backbone alignment |
+| `ContactScore` | Fraction of native protein–ligand contacts retained, normalised to the mean contact count over the first 1 ns and capped at 1.0 |
+| `CompScore` | `PoseScore − 5 × ContactScore`, computed frame-by-frame |
+
+Frame 0 of the trajectory is used as the RMSD reference and is excluded from the scoring rows, giving 99 scored frames per 100-frame trajectory.
+
+### Final results (`output_dir/results.csv`)
+
+A single-row CSV with 6 columns produced after all replicas complete:
+
+| Column | Definition |
+|--------|-----------|
+| `CompScore` | Mean CompScore over the collation window (see below) |
+| `CompScoreSD` | Standard deviation of CompScore over the collation window |
+| `PoseScore` | Mean PoseScore over the collation window |
+| `PoseScoreSD` | Standard deviation of PoseScore |
+| `ContactScore` | Mean ContactScore over the collation window |
+| `ContactScoreSD` | Standard deviation of ContactScore |
+
+---
+
+## How Results Are Collated
+
+After all replicas finish, `collect_results()` pools scores as follows:
+
+1. From each `rep_N/bpmd_results.csv`, take the **last 20% of frames** — i.e., the last `round(n_frames / 5)` rows. For a standard 10 ns / 99-frame run this is approximately the last 20 frames, corresponding to the **last 2 ns** of each replica.
+2. Concatenate these windows across all replicas into a single flat array (≈ 200 values for 10 replicas).
+3. Compute the **mean and standard deviation** of that pooled array for each of the three scores.
+4. Write the six resulting numbers as one row to `results.csv`.
+
+This design reflects the assumption that the ligand pose has reached a (meta)stable state by the final 2 ns, and that averaging across replicas reduces noise from individual bias histories. The SD columns therefore capture **both** within-replica frame-to-frame variability and **between-replica** variability in a single number.
 
 ---
 
 ## Interpreting Results
 
-`results.csv` contains one row per replica with columns: `CompScore`, `PoseScore`, `ContactScore`.
+`results.csv` contains **one row** with mean and SD for each score, pooled from the last 2 ns of all replicas.
 
 ```
 CompScore = PoseScore − 5 × ContactScore
@@ -411,6 +456,15 @@ CompScore = PoseScore − 5 × ContactScore
 
 These cutoffs are system-dependent. Always compare poses relative to each other rather than
 using absolute thresholds.
+
+**Visualising replica convergence:** Use `plot_all_reps()` from `openbpmd.analysis` to plot
+mean ± SD of all three scores over time across all replicas. Poses where CompScore drops and
+stabilises early are more confidently scored than those that remain near zero throughout.
+
+```python
+import openbpmd.analysis
+openbpmd.analysis.plot_all_reps('path/to/output_dir', save_fig='scores.png')
+```
 
 **Checking GCMC quality:** Inspect `gcmc.log` to verify water exchange occurred:
 
